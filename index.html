@@ -121,6 +121,7 @@ const SVC = '82790000' + BASE, NONCE = '82790001' + BASE, CMD = '82790002' + BAS
       STATUS = '82790003' + BASE, CLIPS = '82790004' + BASE;
 const $ = id => document.getElementById(id);
 let dev = null, chars = {}, queue = Promise.resolve(), timer = null;
+let wantConnected = false, retryTimer = null;   /* stay connected until "斷開" (like FoxBait) */
 
 function say(t, err) { const m = $('msg'); m.textContent = t || ''; m.className = err ? 'err' : ''; }
 
@@ -180,6 +181,24 @@ async function act(cmd, okText) {
 /* ---- connect ---- */
 if (!navigator.bluetooth) { $('nobt').hidden = false; $('connect').disabled = true; }
 
+/* Open the GATT link, then prove the PIN with a signed "hb": the speaker then
+   keeps a connection whose reads arrive (status every 15 s) and asks the phone
+   for a slow rhythm. Without the PIN it drops us after 30 s, as a stranger. */
+async function openLink() {
+  say('連接緊 ' + (dev.name || '') + ' …');
+  const srv = await (await dev.gatt.connect()).getPrimaryService(SVC);
+  for (const u of [NONCE, CMD, STATUS, CLIPS]) chars[u] = await srv.getCharacteristic(u);
+  $('devname').textContent = dev.name || '';
+  $('panel').classList.remove('hide'); $('disconnect').classList.remove('hide');
+  $('connect').textContent = '重新連接';
+  let held = false;
+  if (pin()) { try { await send('hb'); held = true; } catch (e) { say(e.message, true); } }
+  if (held) say('連接咗，會一直連住');
+  else if (!pin()) say('連接咗：打咗 PIN 先會一直連住', true);
+  await loadClips(); await refresh();
+  clearInterval(timer); timer = setInterval(() => { if (dev && dev.gatt.connected) refresh(); }, 15000);
+}
+
 $('connect').onclick = async () => {
   try {
     if (!dev) {
@@ -187,25 +206,32 @@ $('connect').onclick = async () => {
         filters: [{ namePrefix: 'Speaker-' }, { services: [SVC] }], optionalServices: [SVC] });
       dev.addEventListener('gattserverdisconnected', onGone);
     }
-    say('連接緊 ' + (dev.name || '') + ' …');
-    const srv = await (await dev.gatt.connect()).getPrimaryService(SVC);
-    for (const u of [NONCE, CMD, STATUS, CLIPS]) chars[u] = await srv.getCharacteristic(u);
-    $('devname').textContent = dev.name || '';
-    $('panel').classList.remove('hide'); $('disconnect').classList.remove('hide');
-    $('connect').textContent = '重新連接';
-    say('連接咗');
-    await loadClips(); await refresh();
-    clearInterval(timer); timer = setInterval(() => { if (dev && dev.gatt.connected) refresh(); }, 15000);
+    wantConnected = true;
+    clearTimeout(retryTimer);
+    await openLink();
   } catch (e) {
     if (e.name === 'NotFoundError') return say('冇揀到喇叭');
     say('連唔到：' + (e.message || e), true);
   }
 };
-$('disconnect').onclick = () => { if (dev && dev.gatt.connected) dev.gatt.disconnect(); };
+$('disconnect').onclick = () => {
+  wantConnected = false; clearTimeout(retryTimer);
+  if (dev && dev.gatt.connected) dev.gatt.disconnect();
+};
 function onGone() {
   clearInterval(timer);
   $('disconnect').classList.add('hide');
-  say('斷咗線（閒置 30 秒會自動斷）：撳「重新連接」', false);
+  if (!wantConnected) return say('斷開咗');
+  say('斷咗線，自動重連緊 …', true);
+  retry(1);
+}
+function retry(n) {                    /* every 5 s while the page wants the speaker */
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(async () => {
+    if (!wantConnected || !dev || dev.gatt.connected) return;
+    try { await openLink(); }
+    catch (e) { say('重連緊（第 ' + n + ' 次）…', true); retry(n + 1); }
+  }, 5000);
 }
 
 /* ---- status ---- */
