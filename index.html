@@ -7,8 +7,9 @@
 <!--
   Solar speaker control over BLE, for Bluefy on iPhone (iOS Safari has no Web
   Bluetooth) or Chrome on Android / desktop. Protocol: firmware main/ble.h.
-  The key never leaves the phone: typed once, or given as #k=<hex> in the link,
-  and kept in localStorage. Source: actuators/src/speaker/ble_page/ (s-366).
+  The 6-digit PIN is typed once and kept in this browser's localStorage; the
+  HMAC key is SHA-256("speaker-pin:" + PIN), so the PIN never goes over the
+  air. Source: actuators/src/speaker/ble_page/ (s-366).
 -->
 <style>
   :root { --bg:#f6f4ef; --card:#fff; --ink:#1d2321; --mute:#6b736f; --acc:#1f7a5a; --warn:#b5462f; --line:#e3dfd6; }
@@ -43,10 +44,10 @@
 <div id="msg"></div>
 
 <div class="card" id="keycard">
-  <h2>BLE 鎖匙（只存喺呢部手機）</h2>
-  <input type="text" id="key" placeholder="32-64 個 hex 字" autocomplete="off" autocapitalize="off" spellcheck="false">
+  <h2>喇叭 PIN（6 位數字，只記喺呢部手機）</h2>
+  <input type="password" id="key" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6 位數字" autocomplete="off">
   <div style="height:8px"></div>
-  <button id="savekey">儲存鎖匙</button>
+  <button id="savekey">記住 PIN</button>
 </div>
 
 <div class="card">
@@ -101,6 +102,16 @@
       </select>
     </div>
   </div>
+
+  <div class="card">
+    <h2>PIN</h2>
+    <div class="row">
+      <input type="password" id="newpin" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="新 PIN（6 位數字）" autocomplete="off">
+      <button id="setpin" style="flex:0 0 auto;width:auto">改喇叭 PIN</button>
+    </div>
+    <div style="height:8px"></div>
+    <button class="ghost" id="forget">呢部手機重新打 PIN</button>
+  </div>
 </div>
 
 <script>
@@ -113,27 +124,28 @@ let dev = null, chars = {}, queue = Promise.resolve(), timer = null;
 
 function say(t, err) { const m = $('msg'); m.textContent = t || ''; m.className = err ? 'err' : ''; }
 
-/* ---- key: #k=<hex> in the link, else what was saved ---- */
-function keyHex() { return localStorage.getItem('spkKey') || ''; }
-function validHex(h) { return /^[0-9a-fA-F]+$/.test(h) && h.length % 2 === 0 && h.length >= 32 && h.length <= 64; }
-(function takeKeyFromLink() {
-  const m = location.hash.match(/k=([0-9a-fA-F]+)/);
-  if (m && validHex(m[1])) { localStorage.setItem('spkKey', m[1].toLowerCase()); say('鎖匙已存入呢部手機'); }
-  if (m) history.replaceState(null, '', location.pathname);   /* the key does not stay in the address */
-})();
-function showKeyCard() { $('keycard').classList.toggle('hide', !!keyHex()); }
+/* ---- PIN, kept in this browser ---- */
+localStorage.removeItem('spkKey');      /* the old 64-hex key, before the PIN (2026-11-11) */
+if (/k=/.test(location.hash)) history.replaceState(null, '', location.pathname);
+const validPin = p => /^[0-9]{6}$/.test(p);
+function pin() { return localStorage.getItem('spkPin') || ''; }
+function showKeyCard() { $('keycard').classList.toggle('hide', !!pin()); }
 $('savekey').onclick = () => {
-  const h = $('key').value.trim();
-  if (!validHex(h)) return say('鎖匙要係 32-64 個 hex 字', true);
-  localStorage.setItem('spkKey', h.toLowerCase()); $('key').value = ''; showKeyCard(); say('鎖匙已儲存');
+  const p = $('key').value.trim();
+  if (!validPin(p)) return say('PIN 要係 6 位數字', true);
+  localStorage.setItem('spkPin', p); $('key').value = ''; showKeyCard(); say('記住咗 PIN');
 };
+$('forget').onclick = () => { localStorage.removeItem('spkPin'); showKeyCard(); $('key').focus(); say('喺上面重新打 PIN'); };
 showKeyCard();
 
-/* ---- HMAC tag, as tools/speaker_ble.py: first 8 bytes of HMAC-SHA256(key, nonce || cmd), hex ---- */
-const hexToBytes = h => new Uint8Array(h.match(/../g).map(b => parseInt(b, 16)));
+/* ---- HMAC tag, as tools/speaker_ble.py: key = SHA-256("speaker-pin:" + PIN);
+   tag = first 8 bytes of HMAC-SHA256(key, nonce || cmd), hex ---- */
 const bytesToHex = b => Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
-async function tag(keyHexStr, nonce, cmd) {
-  const k = await crypto.subtle.importKey('raw', hexToBytes(keyHexStr), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+async function pinKey(p) {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode('speaker-pin:' + p)));
+}
+async function tag(p, nonce, cmd) {
+  const k = await crypto.subtle.importKey('raw', await pinKey(p), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   const c = new TextEncoder().encode(cmd);
   const msg = new Uint8Array(nonce.length + c.length); msg.set(nonce); msg.set(c, nonce.length);
   return bytesToHex(new Uint8Array(await crypto.subtle.sign('HMAC', k, msg)).slice(0, 8));
@@ -148,14 +160,14 @@ async function write(uuid, bytes) {
   return c.writeValueWithResponse ? c.writeValueWithResponse(bytes) : c.writeValue(bytes);
 }
 
-async function send(cmd) {
-  const key = keyHex();
-  if (!key) { showKeyCard(); throw new Error('未有鎖匙'); }
+async function send(cmd, pinOverride) {
+  const p = pinOverride || pin();
+  if (!p) { showKeyCard(); throw new Error('未打 PIN：喺上面打喇叭嘅 6 位數字 PIN'); }
   return serial(async () => {
     const nonce = new Uint8Array((await chars[NONCE].readValue()).buffer);
-    const t = await tag(key, nonce, cmd);
+    const t = await tag(p, nonce, cmd);
     try { await write(CMD, new TextEncoder().encode(cmd + '|' + t)); }
-    catch (e) { throw new Error('喇叭拒絕咗（鎖匙錯、忙緊，或者冇呢段錄音）'); }
+    catch (e) { throw new Error('喇叭拒絕咗（PIN 錯、錯太多次鎖咗 10 分鐘、忙緊，或者冇呢段錄音）'); }
   });
 }
 
@@ -216,6 +228,7 @@ async function refresh() {
   const l = s.link === 'off' ? '關' : s.link_hb >= 0 && s.link_hb <= 30 ? '連住（' + s.link_hb + ' 秒前有訊號）' : '等緊相機';
   $('link').textContent = l;
   $('last').textContent = s.last || '–';
+  if (s.locked_s > 0) say('PIN 錯太多次：鎖住，仲有 ' + mins(s.locked_s), true);
 }
 $('refresh').onclick = () => refresh();
 
@@ -239,6 +252,13 @@ $('stop').onclick = () => act('stop', '停咗');
 $('vol').oninput = () => { $('volv').textContent = $('vol').value; };
 $('vol').onchange = () => act('vol ' + $('vol').value, '音量 ' + $('vol').value);
 $('wifinow').onclick = () => act('wifi ' + $('wifimin').value, 'Wi-Fi 開咗 ' + $('wifimin').value + ' 分鐘（約 10 秒連上）');
+$('setpin').onclick = async () => {
+  const n = $('newpin').value.trim();
+  if (!validPin(n)) return say('新 PIN 要係 6 位數字', true);
+  if (!dev || !dev.gatt.connected) return say('未連接', true);
+  try { await send('pin ' + n); localStorage.setItem('spkPin', n); $('newpin').value = ''; say('喇叭 PIN 改咗，呢部手機都記住咗新 PIN'); }
+  catch (e) { say(e.message, true); }
+};
 $('lwifi').onchange = () => {
   const v = $('lwifi').value;
   act('lwifi ' + v, v === '0' ? 'Wi-Fi 長開' : '連相機時熄 Wi-Fi，每 ' + v + ' 分鐘報到');
