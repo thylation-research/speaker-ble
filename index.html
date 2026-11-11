@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="zh-HK">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>太陽能喇叭 BLE</title>
+<!--
+  Solar speaker control over BLE, for Bluefy on iPhone (iOS Safari has no Web
+  Bluetooth) or Chrome on Android / desktop. Protocol: firmware main/ble.h.
+  The key never leaves the phone: typed once, or given as #k=<hex> in the link,
+  and kept in localStorage. Source: actuators/src/speaker/ble_page/ (s-366).
+-->
+<style>
+  :root { --bg:#f6f4ef; --card:#fff; --ink:#1d2321; --mute:#6b736f; --acc:#1f7a5a; --warn:#b5462f; --line:#e3dfd6; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.45 -apple-system, "PingFang HK", "Noto Sans HK", sans-serif; background:var(--bg); color:var(--ink);
+         padding:16px 14px calc(24px + env(safe-area-inset-bottom)); }
+  h1 { font-size:20px; margin:4px 0 12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:12px; }
+  .card h2 { font-size:15px; margin:0 0 10px; color:var(--mute); font-weight:600; }
+  button { font:inherit; border:0; border-radius:10px; padding:12px 14px; background:var(--acc); color:#fff; width:100%; }
+  button.ghost { background:#eef2ef; color:var(--ink); }
+  button.stop { background:var(--warn); }
+  button:disabled { opacity:.45; }
+  .row { display:flex; gap:8px; align-items:center; }
+  .row > * { flex:1; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .big { font-size:28px; font-weight:700; }
+  .mute { color:var(--mute); font-size:14px; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 12px; font-size:15px; }
+  .kv div:nth-child(odd) { color:var(--mute); }
+  input[type=text] { font:inherit; width:100%; padding:11px; border:1px solid var(--line); border-radius:10px; }
+  input[type=range] { width:100%; }
+  select { font:inherit; padding:10px; border-radius:10px; border:1px solid var(--line); background:#fff; }
+  #msg { min-height:22px; font-size:14px; margin:4px 2px 10px; }
+  #msg.err { color:var(--warn); }
+  .hide { display:none; }
+  .switch { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+</style>
+</head>
+<body>
+<h1>太陽能喇叭 <span class="mute" id="devname"></span></h1>
+<div id="msg"></div>
+
+<div class="card" id="keycard">
+  <h2>BLE 鎖匙（只存喺呢部手機）</h2>
+  <input type="text" id="key" placeholder="32-64 個 hex 字" autocomplete="off" autocapitalize="off" spellcheck="false">
+  <div style="height:8px"></div>
+  <button id="savekey">儲存鎖匙</button>
+</div>
+
+<div class="card">
+  <div class="row">
+    <button id="connect">連接喇叭</button>
+    <button id="disconnect" class="ghost hide">斷開</button>
+  </div>
+  <p class="mute" id="nobt" style="margin:8px 0 0" hidden>呢個瀏覽器冇 Web Bluetooth：iPhone 請用 Bluefy 開呢頁。</p>
+</div>
+
+<div id="panel" class="hide">
+  <div class="card">
+    <h2>狀態</h2>
+    <div class="row" style="align-items:baseline">
+      <div><span class="big" id="bat">–</span> <span class="mute" id="batmv"></span></div>
+      <button class="ghost" id="refresh" style="flex:0 0 auto;width:auto">更新</button>
+    </div>
+    <div style="height:8px"></div>
+    <div class="kv">
+      <div>Wi-Fi</div><div id="wifi">–</div>
+      <div>相機連線</div><div id="link">–</div>
+      <div>上次指令</div><div id="last">–</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>錄音</h2>
+    <div class="grid" id="clips"></div>
+    <div style="height:8px"></div>
+    <button class="stop" id="stop">停</button>
+  </div>
+
+  <div class="card">
+    <h2>音量 <span id="volv"></span></h2>
+    <input type="range" id="vol" min="0" max="100" step="5">
+  </div>
+
+  <div class="card">
+    <h2>Wi-Fi</h2>
+    <div class="row">
+      <select id="wifimin"><option value="10">10 分鐘</option><option value="30">30 分鐘</option><option value="60">60 分鐘</option></select>
+      <button id="wifinow">即刻開 Wi-Fi</button>
+    </div>
+    <p class="mute" style="margin:8px 0 0">開咗就用得 homelite、Talk 同燒 firmware。</p>
+    <div style="height:14px"></div>
+    <div class="switch">
+      <div>連相機時熄 Wi-Fi（省電）</div>
+      <select id="lwifi">
+        <option value="0">關</option><option value="15">開，每 15 分鐘報到</option>
+        <option value="30">開，每 30 分鐘報到</option><option value="60">開，每 60 分鐘報到</option>
+        <option value="120">開，每 2 個鐘報到</option>
+      </select>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+const BASE = '-8c4d-4be3-84f5-a53b9b63f11c';
+const SVC = '82790000' + BASE, NONCE = '82790001' + BASE, CMD = '82790002' + BASE,
+      STATUS = '82790003' + BASE, CLIPS = '82790004' + BASE;
+const $ = id => document.getElementById(id);
+let dev = null, chars = {}, queue = Promise.resolve(), timer = null;
+
+function say(t, err) { const m = $('msg'); m.textContent = t || ''; m.className = err ? 'err' : ''; }
+
+/* ---- key: #k=<hex> in the link, else what was saved ---- */
+function keyHex() { return localStorage.getItem('spkKey') || ''; }
+function validHex(h) { return /^[0-9a-fA-F]+$/.test(h) && h.length % 2 === 0 && h.length >= 32 && h.length <= 64; }
+(function takeKeyFromLink() {
+  const m = location.hash.match(/k=([0-9a-fA-F]+)/);
+  if (m && validHex(m[1])) { localStorage.setItem('spkKey', m[1].toLowerCase()); say('鎖匙已存入呢部手機'); }
+  if (m) history.replaceState(null, '', location.pathname);   /* the key does not stay in the address */
+})();
+function showKeyCard() { $('keycard').classList.toggle('hide', !!keyHex()); }
+$('savekey').onclick = () => {
+  const h = $('key').value.trim();
+  if (!validHex(h)) return say('鎖匙要係 32-64 個 hex 字', true);
+  localStorage.setItem('spkKey', h.toLowerCase()); $('key').value = ''; showKeyCard(); say('鎖匙已儲存');
+};
+showKeyCard();
+
+/* ---- HMAC tag, as tools/speaker_ble.py: first 8 bytes of HMAC-SHA256(key, nonce || cmd), hex ---- */
+const hexToBytes = h => new Uint8Array(h.match(/../g).map(b => parseInt(b, 16)));
+const bytesToHex = b => Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+async function tag(keyHexStr, nonce, cmd) {
+  const k = await crypto.subtle.importKey('raw', hexToBytes(keyHexStr), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const c = new TextEncoder().encode(cmd);
+  const msg = new Uint8Array(nonce.length + c.length); msg.set(nonce); msg.set(c, nonce.length);
+  return bytesToHex(new Uint8Array(await crypto.subtle.sign('HMAC', k, msg)).slice(0, 8));
+}
+
+/* ---- GATT, one operation at a time ---- */
+function serial(fn) { const p = queue.then(fn, fn); queue = p.catch(() => {}); return p; }
+const dec = v => new TextDecoder().decode(v);
+async function readJson(uuid) { return JSON.parse(dec(await chars[uuid].readValue())); }
+async function write(uuid, bytes) {
+  const c = chars[uuid];
+  return c.writeValueWithResponse ? c.writeValueWithResponse(bytes) : c.writeValue(bytes);
+}
+
+async function send(cmd) {
+  const key = keyHex();
+  if (!key) { showKeyCard(); throw new Error('未有鎖匙'); }
+  return serial(async () => {
+    const nonce = new Uint8Array((await chars[NONCE].readValue()).buffer);
+    const t = await tag(key, nonce, cmd);
+    try { await write(CMD, new TextEncoder().encode(cmd + '|' + t)); }
+    catch (e) { throw new Error('喇叭拒絕咗（鎖匙錯、忙緊，或者冇呢段錄音）'); }
+  });
+}
+
+async function act(cmd, okText) {
+  if (!dev || !dev.gatt.connected) return say('未連接', true);
+  try { await send(cmd); say(okText); setTimeout(refresh, 600); }
+  catch (e) { say(e.message, true); }
+}
+
+/* ---- connect ---- */
+if (!navigator.bluetooth) { $('nobt').hidden = false; $('connect').disabled = true; }
+
+$('connect').onclick = async () => {
+  try {
+    if (!dev) {
+      dev = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: 'Speaker-' }, { services: [SVC] }], optionalServices: [SVC] });
+      dev.addEventListener('gattserverdisconnected', onGone);
+    }
+    say('連接緊 ' + (dev.name || '') + ' …');
+    const srv = await (await dev.gatt.connect()).getPrimaryService(SVC);
+    for (const u of [NONCE, CMD, STATUS, CLIPS]) chars[u] = await srv.getCharacteristic(u);
+    $('devname').textContent = dev.name || '';
+    $('panel').classList.remove('hide'); $('disconnect').classList.remove('hide');
+    $('connect').textContent = '重新連接';
+    say('連接咗');
+    await loadClips(); await refresh();
+    clearInterval(timer); timer = setInterval(() => { if (dev && dev.gatt.connected) refresh(); }, 15000);
+  } catch (e) {
+    if (e.name === 'NotFoundError') return say('冇揀到喇叭');
+    say('連唔到：' + (e.message || e), true);
+  }
+};
+$('disconnect').onclick = () => { if (dev && dev.gatt.connected) dev.gatt.disconnect(); };
+function onGone() {
+  clearInterval(timer);
+  $('disconnect').classList.add('hide');
+  say('斷咗線（閒置 30 秒會自動斷）：撳「重新連接」', false);
+}
+
+/* ---- status ---- */
+function mins(s) { return s < 90 ? s + ' 秒' : Math.round(s / 60) + ' 分鐘'; }
+async function refresh() {
+  if (!dev || !dev.gatt.connected) return;
+  let s;
+  try { s = await serial(() => readJson(STATUS)); } catch (e) { return say('讀唔到狀態', true); }
+  $('bat').textContent = s.bat_pct >= 0 ? s.bat_pct + '%' : '–';
+  $('batmv').textContent = s.bat_mv > 0 ? s.bat_mv + ' mV' : '';
+  if (document.activeElement !== $('vol')) { $('vol').value = s.vol; $('volv').textContent = s.vol; }
+  let w;
+  if (s.lwifi === 'off' || s.lwifi === undefined) w = '長開';
+  else if (s.lwifi === 'parked') w = '熄咗（省電）' + (s.lw_next >= 0 ? '，' + mins(s.lw_next) + '後報到' : '');
+  else w = '開緊' + (s.wifi_s > 0 ? '（仲有 ' + mins(s.wifi_s) + '）' : '');
+  $('wifi').textContent = w;
+  const lv = s.lwifi === 'off' ? '0' : String(s.lw_every);
+  if (![...$('lwifi').options].some(o => o.value === lv)) $('lwifi').add(new Option('開，每 ' + lv + ' 分鐘報到', lv));
+  $('lwifi').value = lv;
+  const l = s.link === 'off' ? '關' : s.link_hb >= 0 && s.link_hb <= 30 ? '連住（' + s.link_hb + ' 秒前有訊號）' : '等緊相機';
+  $('link').textContent = l;
+  $('last').textContent = s.last || '–';
+}
+$('refresh').onclick = () => refresh();
+
+/* ---- clips ---- */
+async function loadClips() {
+  let j;
+  try { j = await serial(() => readJson(CLIPS)); } catch (e) { return say('讀唔到錄音清單', true); }
+  const box = $('clips'); box.textContent = '';
+  if (!j.ok || !j.clips.length) { box.innerHTML = '<p class="mute">冇錄音</p>'; return; }
+  for (const c of j.clips) {
+    const b = document.createElement('button');
+    b.className = 'ghost';
+    b.textContent = '▶ ' + c.n + ' ' + (c.name || '') + ' · ' + c.s.toFixed(0) + 's';
+    b.onclick = () => act('play ' + c.n, '播緊第 ' + c.n + ' 段');
+    box.appendChild(b);
+  }
+}
+$('stop').onclick = () => act('stop', '停咗');
+
+/* ---- volume, Wi-Fi ---- */
+$('vol').oninput = () => { $('volv').textContent = $('vol').value; };
+$('vol').onchange = () => act('vol ' + $('vol').value, '音量 ' + $('vol').value);
+$('wifinow').onclick = () => act('wifi ' + $('wifimin').value, 'Wi-Fi 開咗 ' + $('wifimin').value + ' 分鐘（約 10 秒連上）');
+$('lwifi').onchange = () => {
+  const v = $('lwifi').value;
+  act('lwifi ' + v, v === '0' ? 'Wi-Fi 長開' : '連相機時熄 Wi-Fi，每 ' + v + ' 分鐘報到');
+};
+</script>
+</body>
+</html>
